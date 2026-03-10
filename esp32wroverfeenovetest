@@ -1,0 +1,713 @@
+/*
+ * ================================================================
+ *  ESP32 WROVER DIAGNOSTIC SKETCH
+ *  Freenove ESP32-WROVER  |  Arduino Core v3.x
+ * ================================================================
+ *
+ *  ARDUINO IDE BOARD SETTINGS (Tools menu):
+ *  ─────────────────────────────────────────
+ *  Board            : "ESP32 Wrover Module"
+ *  CPU Frequency    : "240MHz (WiFi/BT)"
+ *  Flash Mode       : "QIO"
+ *  Flash Frequency  : "80MHz"
+ *  Flash Size       : "4MB (32Mb)"
+ *  Partition Scheme : "Huge APP (3MB No OTA/1MB SPIFFS)"  ← camera needs this
+ *  PSRAM            : "Enabled"                           ← CRITICAL
+ *  Upload Speed     : "921600"
+ *  Port             : your COM port
+ *
+ *  BAUD RATE: 115200
+ *
+ *  WIRING NOTES (Freenove WROVER pin conflicts to be aware of):
+ *  ─────────────────────────────────────────────────────────────
+ *  GPIO2  = SD card MISO  (also onboard LED — shared, safe when SD CS is HIGH)
+ *  GPIO4  = Camera D0/Y2  (touch T0 disabled in touch test)
+ *  GPIO13 = SD CS
+ *  GPIO14 = SD SCK
+ *  GPIO15 = SD MOSI
+ *  GPIO21 = Camera XCLK   (I2C primary scan skipped — would conflict)
+ *  GPIO22 = Camera PCLK   (I2C primary scan skipped — would conflict)
+ *  GPIO25 = Camera VSYNC
+ *  GPIO26 = Camera SIOD (SDA)
+ *  GPIO27 = Camera SIOC (SCL)
+ *  GPIO32 = Touch T9      (free)
+ *  GPIO33 = Touch T8      (free)
+ *
+ *  TESTS:
+ *   1.  Chip Info        – model, cores, revision, MAC, SDK
+ *   2.  Flash & PSRAM    – sizes, heap, PSRAM verified present
+ *   3.  PSRAM Stress     – malloc 4 MB in PSRAM, write/read pattern
+ *   4.  Temperature      – internal die temperature
+ *   5.  ADC              – GPIO34 float read (input-only, safe)
+ *   6.  GPIO / LED       – blink GPIO2 (SD deinitialized first)
+ *   7.  WiFi             – scan + channel list
+ *   8.  Bluetooth        – BT / BLE capability
+ *   9.  Hardware Timer   – 1 Hz ISR, counted over 2 s
+ *  10.  NVS Preferences  – flash read/write round-trip
+ *  11.  SD Card          – mount, write, read, verify, unmount
+ *  12.  Camera           – init OV2640, capture frame, report size
+ *  13.  I2C Scanner      – GPIO16/17 only (21/22/26/27 used by camera)
+ *  14.  Touch Pins       – T1–T9 (T0=GPIO4 skipped, used by camera)
+ * ================================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Preferences.h>
+#include "esp_chip_info.h"
+#include "esp_mac.h"
+#include "esp_camera.h"
+
+// ── Freenove WROVER Pin Map ───────────────────────────────────
+
+// Onboard LED (shared with SD MISO — safe when SD not mounted)
+#define LED_PIN        2
+
+// ADC (input-only, no camera/SD conflict)
+#define ADC_PIN        34
+
+// SD card — SPI mode
+#define SD_CS_PIN      13
+#define SD_MOSI_PIN    15
+#define SD_SCK_PIN     14
+#define SD_MISO_PIN    2    // shared with LED — deinit SD before blinking
+
+// I2C — safe pins (21/22 = camera XCLK/PCLK, 26/27 = camera SIOD/SIOC)
+#define I2C_SDA        16
+#define I2C_SCL        17
+#define I2C_FREQ       100000
+
+// Camera — OV2640 on Freenove WROVER
+#define CAM_PIN_PWDN   -1
+#define CAM_PIN_RESET  -1
+#define CAM_PIN_XCLK   21
+#define CAM_PIN_SIOD   26
+#define CAM_PIN_SIOC   27
+#define CAM_PIN_D7     35
+#define CAM_PIN_D6     34
+#define CAM_PIN_D5     39
+#define CAM_PIN_D4     36
+#define CAM_PIN_D3     19
+#define CAM_PIN_D2     18
+#define CAM_PIN_D1     5
+#define CAM_PIN_D0     4
+#define CAM_PIN_VSYNC  25
+#define CAM_PIN_HREF   23
+#define CAM_PIN_PCLK   22
+
+// Blink config
+#define BLINK_TIMES    6
+#define BLINK_DELAY_MS 250
+
+// ─────────────────────────────────────────────────────────────
+
+Preferences prefs;
+volatile uint32_t timerCount = 0;
+hw_timer_t *diagTimer = NULL;
+
+void IRAM_ATTR onTimer() { timerCount++; }
+
+// ── Helpers ───────────────────────────────────────────────────
+void printHeader(const char *title) {
+  Serial.println();
+  Serial.println("----------------------------------------");
+  Serial.printf ("  %s\n", title);
+  Serial.println("----------------------------------------");
+}
+void pass(const char *msg)                  { Serial.printf("  [PASS] %s\n", msg); }
+void fail(const char *msg)                  { Serial.printf("  [FAIL] %s\n", msg); }
+void warn(const char *msg)                  { Serial.printf("  [WARN] %s\n", msg); }
+void info(const char *lbl, const char *val) { Serial.printf("         %-26s %s\n", lbl, val); }
+void infoU(const char *lbl, uint32_t v, const char *u = "") {
+  Serial.printf("         %-26s %u %s\n", lbl, v, u);
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 1 — CHIP INFO
+// ════════════════════════════════════════════════════════════
+void testChipInfo() {
+  printHeader("1 . CHIP INFO");
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+
+  const char *model = "Unknown";
+  switch (chip.model) {
+    case CHIP_ESP32:   model = "ESP32 (WROVER)"; break;
+    case CHIP_ESP32S2: model = "ESP32-S2";       break;
+    case CHIP_ESP32S3: model = "ESP32-S3";       break;
+    case CHIP_ESP32C3: model = "ESP32-C3";       break;
+    default:           model = "Other";          break;
+  }
+  info("Model:",          model);
+  infoU("CPU cores:",     chip.cores);
+  infoU("CPU frequency:", getCpuFrequencyMhz(), "MHz");
+  infoU("Chip revision:", chip.revision);
+  info("SDK version:",    ESP.getSdkVersion());
+
+  char feat[80] = "";
+  if (chip.features & CHIP_FEATURE_WIFI_BGN)  strcat(feat, "WiFi ");
+  if (chip.features & CHIP_FEATURE_BT)        strcat(feat, "BT ");
+  if (chip.features & CHIP_FEATURE_BLE)       strcat(feat, "BLE ");
+  if (chip.features & CHIP_FEATURE_EMB_FLASH) strcat(feat, "EmbFlash ");
+  if (strlen(feat) == 0) strcat(feat, "(none)");
+  info("Features:", feat);
+
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char macStr[20];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  info("WiFi MAC:", macStr);
+
+  pass("Chip info OK");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 2 — FLASH & PSRAM
+// ════════════════════════════════════════════════════════════
+void testMemory() {
+  printHeader("2 . FLASH & PSRAM");
+
+  infoU("Flash size:",    ESP.getFlashChipSize()   / 1024, "KB");
+  infoU("Flash speed:",   ESP.getFlashChipSpeed()  / 1000000, "MHz");
+  infoU("Sketch size:",   ESP.getSketchSize(),      "bytes");
+  infoU("Free sketch:",   ESP.getFreeSketchSpace(), "bytes");
+  infoU("Free heap:",     ESP.getFreeHeap(),         "bytes");
+  infoU("Min free heap:", ESP.getMinFreeHeap(),      "bytes");
+  infoU("Max alloc heap:",ESP.getMaxAllocHeap(),     "bytes");
+
+  if (psramFound()) {
+    infoU("PSRAM size:",  ESP.getPsramSize()  / (1024*1024), "MB");
+    infoU("Free PSRAM:",  ESP.getFreePsram()  / 1024, "KB");
+    infoU("Max PSRAM alloc:", ESP.getMaxAllocPsram() / 1024, "KB");
+    pass("PSRAM detected and reported");
+  } else {
+    fail("PSRAM NOT found — check board setting: Tools > PSRAM > Enabled");
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 3 — PSRAM STRESS TEST
+//  Allocates a 4 MB buffer in PSRAM, writes a walking pattern,
+//  reads it back, and verifies. Confirms PSRAM is functional.
+// ════════════════════════════════════════════════════════════
+void testPSRAMStress() {
+  printHeader("3 . PSRAM STRESS TEST  (4 MB alloc + verify)");
+
+  if (!psramFound()) {
+    warn("PSRAM not found — skipping stress test");
+    return;
+  }
+
+  const size_t TEST_SIZE = 4 * 1024 * 1024;  // 4 MB
+  Serial.printf("         Allocating %u MB in PSRAM...\n", (unsigned)(TEST_SIZE / (1024*1024)));
+
+  uint8_t *buf = (uint8_t *)ps_malloc(TEST_SIZE);
+  if (!buf) {
+    fail("ps_malloc failed — PSRAM may not be enabled or is defective");
+    return;
+  }
+  infoU("Buffer address:", (uint32_t)(uintptr_t)buf);
+  Serial.println("         Writing pattern...");
+
+  // Write walking byte pattern
+  for (size_t i = 0; i < TEST_SIZE; i++) buf[i] = (uint8_t)(i & 0xFF);
+
+  Serial.println("         Verifying pattern...");
+  size_t errors = 0;
+  for (size_t i = 0; i < TEST_SIZE; i++) {
+    if (buf[i] != (uint8_t)(i & 0xFF)) errors++;
+  }
+
+  free(buf);
+
+  if (errors == 0) {
+    pass("4 MB PSRAM write/read — zero errors");
+  } else {
+    char msg[48];
+    snprintf(msg, sizeof(msg), "%u byte errors — PSRAM may be faulty", (unsigned)errors);
+    fail(msg);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 4 — INTERNAL TEMPERATURE
+// ════════════════════════════════════════════════════════════
+void testTemperature() {
+  printHeader("4 . INTERNAL TEMPERATURE SENSOR");
+
+  float tempC = temperatureRead();
+  if (isnan(tempC)) {
+    fail("Sensor returned NaN");
+  } else {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%.1f C  /  %.1f F", tempC, tempC * 9.0f / 5.0f + 32.0f);
+    info("Die temperature:", buf);
+    (tempC > 0 && tempC < 120) ? pass("Temperature plausible") : fail("Out of expected range");
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 5 — ADC
+// ════════════════════════════════════════════════════════════
+void testADC() {
+  printHeader("5 . ADC  (GPIO34 — floating, input-only)");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogRead(ADC_PIN); delay(5); }
+  uint32_t avg = sum / 16;
+
+  infoU("GPIO:", ADC_PIN);
+  infoU("12-bit avg:", avg, "(0-4095, float = noise, OK)");
+  infoU("Approx mV:", (avg * 3300UL) / 4095, "mV");
+  pass("ADC read complete");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 6 — GPIO / LED BLINK
+//  GPIO2 = LED = SD MISO.  SD must be deinitialized first.
+//  testSD() calls SD.end() before returning, so order is:
+//  testGPIO() runs BEFORE testSD() in setup() intentionally.
+// ════════════════════════════════════════════════════════════
+void testGPIO() {
+  printHeader("6 . GPIO / LED BLINK  (GPIO2)");
+
+  info("Note:", "GPIO2 = onboard LED = SD MISO (shared)");
+  info("       ", "LED test runs before SD init to avoid conflict");
+
+  pinMode(LED_PIN, OUTPUT);
+  Serial.printf("         Blinking %d times...\n", BLINK_TIMES);
+  for (int i = 0; i < BLINK_TIMES; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(BLINK_DELAY_MS);
+    digitalWrite(LED_PIN, LOW);  delay(BLINK_DELAY_MS);
+  }
+  pass("GPIO blink done");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 7 — WIFI SCAN
+// ════════════════════════════════════════════════════════════
+void testWiFi() {
+  printHeader("7 . WiFi SCAN");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("         Scanning...");
+  int n = WiFi.scanNetworks();
+  if (n < 0) { fail("Scan failed"); return; }
+
+  char buf[12]; snprintf(buf, sizeof(buf), "%d", n);
+  info("Networks found:", buf);
+
+  for (int i = 0; i < min(n, 5); i++) {
+    Serial.printf("           [%d] RSSI %-4d  Ch %-2d  %s\n",
+                  i + 1, WiFi.RSSI(i), WiFi.channel(i), WiFi.SSID(i).c_str());
+  }
+  if (n > 5) Serial.printf("           ... and %d more\n", n - 5);
+  WiFi.scanDelete();
+  pass("WiFi scan OK");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 8 — BLUETOOTH
+// ════════════════════════════════════════════════════════════
+void testBluetooth() {
+  printHeader("8 . BLUETOOTH CAPABILITY");
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  bool hasBT  = (chip.features & CHIP_FEATURE_BT)  != 0;
+  bool hasBLE = (chip.features & CHIP_FEATURE_BLE) != 0;
+  hasBT  ? pass("Classic BT present") : info("Classic BT:", "not available");
+  hasBLE ? pass("BLE present")        : info("BLE:",        "not available");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 9 — HARDWARE TIMER  (v3 API)
+// ════════════════════════════════════════════════════════════
+void testTimer() {
+  printHeader("9 . HARDWARE TIMER  (v3 API)");
+
+  timerCount = 0;
+  diagTimer = timerBegin(1000000);
+  timerAttachInterrupt(diagTimer, &onTimer);
+  timerAlarm(diagTimer, 1000000, true, 0);
+
+  Serial.println("         Waiting ~2.1 s...");
+  delay(2100);
+  timerEnd(diagTimer);
+
+  infoU("ISR fires in 2.1 s:", timerCount, "(expect 2)");
+  (timerCount >= 2) ? pass("Timer ISR working") : fail("Timer did not fire correctly");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 10 — NVS PREFERENCES
+// ════════════════════════════════════════════════════════════
+void testPreferences() {
+  printHeader("10 . NVS PREFERENCES");
+
+  const uint32_t MAGIC = 0xDEADBEEF;
+  prefs.begin("diag", false);
+  prefs.putUInt("magic", MAGIC);
+  uint32_t rb = prefs.getUInt("magic", 0);
+  prefs.remove("magic");
+  prefs.end();
+
+  char buf[16]; snprintf(buf, sizeof(buf), "0x%08X", rb);
+  info("Read back:", buf);
+  (rb == MAGIC) ? pass("NVS round-trip OK") : fail("NVS mismatch — flash issue?");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 11 — SD CARD
+//  Uses SPI mode.  Freenove WROVER wiring:
+//    CS=GPIO13  MOSI=GPIO15  SCK=GPIO14  MISO=GPIO2
+//  Writes a test file, reads it back, verifies, then removes it.
+//  Calls SD.end() when done so GPIO2 can be used again.
+// ════════════════════════════════════════════════════════════
+void testSD() {
+  printHeader("11 . SD CARD");
+
+  info("CS:",   "GPIO13");
+  info("MOSI:", "GPIO15");
+  info("SCK:",  "GPIO14");
+  info("MISO:", "GPIO2  (shared with onboard LED)");
+
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+  if (!SD.begin(SD_CS_PIN)) {
+    fail("SD mount failed — check card is inserted and formatted FAT32");
+    SPI.end();
+    return;
+  }
+
+  // Card type
+  uint8_t cardType = SD.cardType();
+  const char *typeStr = "Unknown";
+  switch (cardType) {
+    case CARD_MMC:  typeStr = "MMC";      break;
+    case CARD_SD:   typeStr = "SD";       break;
+    case CARD_SDHC: typeStr = "SDHC";     break;
+    case CARD_NONE: typeStr = "NONE";     break;
+  }
+  info("Card type:", typeStr);
+  infoU("Card size:", (uint32_t)(SD.cardSize() / (1024*1024)), "MB");
+  infoU("Total space:", (uint32_t)(SD.totalBytes() / (1024*1024)), "MB");
+  infoU("Used space:", (uint32_t)(SD.usedBytes() / (1024*1024)), "MB");
+
+  if (cardType == CARD_NONE) {
+    fail("No SD card detected");
+    SD.end(); SPI.end();
+    return;
+  }
+
+  // Write test
+  const char *testPath = "/diag_test.txt";
+  const char *testData = "ESP32-WROVER DIAG OK 0xDEADBEEF";
+
+  File f = SD.open(testPath, FILE_WRITE);
+  if (!f) {
+    fail("Could not open file for writing");
+    SD.end(); SPI.end();
+    return;
+  }
+  f.print(testData);
+  f.close();
+  pass("File write OK");
+
+  // Read back and verify
+  f = SD.open(testPath, FILE_READ);
+  if (!f) {
+    fail("Could not open file for reading");
+    SD.end(); SPI.end();
+    return;
+  }
+  char readBuf[64] = {0};
+  int bytesRead = f.readBytes(readBuf, sizeof(readBuf) - 1);
+  f.close();
+
+  infoU("Bytes read back:", (uint32_t)bytesRead);
+  info("Content:", readBuf);
+
+  if (strcmp(readBuf, testData) == 0) {
+    pass("SD write/read/verify — content matches");
+  } else {
+    fail("SD content mismatch");
+  }
+
+  // Cleanup
+  SD.remove(testPath);
+  SD.end();
+  SPI.end();
+  pass("SD test complete, card unmounted");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 12 — CAMERA  (OV2640)
+//  Initialises the camera, captures one frame at QVGA,
+//  reports the compressed JPEG size, then deinitialises.
+//  Full PSRAM must be enabled — frame buffer lives in PSRAM.
+// ════════════════════════════════════════════════════════════
+void testCamera() {
+  printHeader("12 . CAMERA  (OV2640 via esp_camera)");
+
+  if (!psramFound()) {
+    fail("PSRAM not found — camera requires PSRAM. Enable in Tools > PSRAM.");
+    return;
+  }
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = CAM_PIN_D0;
+  config.pin_d1       = CAM_PIN_D1;
+  config.pin_d2       = CAM_PIN_D2;
+  config.pin_d3       = CAM_PIN_D3;
+  config.pin_d4       = CAM_PIN_D4;
+  config.pin_d5       = CAM_PIN_D5;
+  config.pin_d6       = CAM_PIN_D6;
+  config.pin_d7       = CAM_PIN_D7;
+  config.pin_xclk     = CAM_PIN_XCLK;
+  config.pin_pclk     = CAM_PIN_PCLK;
+  config.pin_vsync    = CAM_PIN_VSYNC;
+  config.pin_href     = CAM_PIN_HREF;
+  config.pin_sccb_sda = CAM_PIN_SIOD;
+  config.pin_sccb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn     = CAM_PIN_PWDN;
+  config.pin_reset    = CAM_PIN_RESET;
+  config.xclk_freq_hz = 20000000;          // 20 MHz XCLK
+  config.pixel_format = PIXFORMAT_JPEG;    // JPEG = smaller buffer
+  config.frame_size   = FRAMESIZE_QVGA;    // 320x240 for quick test
+  config.jpeg_quality = 12;                // 0=best, 63=worst
+  config.fb_count     = 1;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+
+  Serial.println("         Initialising OV2640...");
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "esp_camera_init failed: 0x%x", err);
+    fail(msg);
+    Serial.println("         Common causes: no camera connected, wrong pin map,");
+    Serial.println("         PSRAM disabled, or wrong board selected.");
+    return;
+  }
+  pass("Camera init OK");
+
+  // Get sensor info
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "0x%02X", s->id.PID);
+    info("Sensor PID:", buf);
+    info("Expected OV2640:", "0x26");
+    (s->id.PID == 0x26) ? pass("OV2640 confirmed") : warn("Different sensor detected — check camera module");
+  }
+
+  // Capture a frame
+  Serial.println("         Capturing QVGA JPEG frame...");
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    fail("Frame capture failed — buffer empty");
+    esp_camera_deinit();
+    return;
+  }
+
+  infoU("Frame width:",  fb->width,  "px");
+  infoU("Frame height:", fb->height, "px");
+  infoU("JPEG size:",    fb->len,    "bytes");
+  infoU("Timestamp:",    (uint32_t)fb->timestamp.tv_sec);
+
+  bool sizeOK = (fb->len > 1000 && fb->len < 200000);
+  esp_camera_fb_return(fb);
+  esp_camera_deinit();
+
+  sizeOK ? pass("Frame captured — JPEG size looks valid") :
+           fail("Frame size suspicious — may be corrupt");
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 13 — I2C SCANNER
+//  WROVER camera occupies GPIO21,22 (XCLK/PCLK) and
+//  GPIO26,27 (SIOD/SIOC).  Only GPIO16/17 are safe here.
+// ════════════════════════════════════════════════════════════
+void testI2C() {
+  printHeader("13 . I2C SCANNER");
+
+  warn("GPIO21,22,26,27 used by camera — only scanning GPIO16/17");
+  Serial.printf("\n         SDA=GPIO%d  SCL=GPIO%d  @ %d kHz\n\n",
+                I2C_SDA, I2C_SCL, I2C_FREQ / 1000);
+
+  Wire.begin(I2C_SDA, I2C_SCL, I2C_FREQ);
+  delay(50);
+
+  int found = 0;
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      const char *name = "";
+      switch (addr) {
+        case 0x20: name = " (PCF8574 / MCP23017)";  break;
+        case 0x27: name = " (PCF8574 LCD)";          break;
+        case 0x29: name = " (VL53L0X / TCS34725)";  break;
+        case 0x3C: name = " (SSD1306 OLED)";         break;
+        case 0x3D: name = " (SSD1306 OLED alt)";     break;
+        case 0x40: name = " (INA219 / PCA9685)";     break;
+        case 0x48: name = " (ADS1115 ADDR=GND)";     break;
+        case 0x49: name = " (ADS1115 ADDR=VCC)";     break;
+        case 0x4A: name = " (ADS1115 ADDR=SDA)";     break;
+        case 0x4B: name = " (ADS1115 ADDR=SCL)";     break;
+        case 0x57: name = " (ATSHA204A)";             break;
+        case 0x68: name = " (MPU6050 / DS3231)";     break;
+        case 0x69: name = " (MPU6050 AD0=1)";        break;
+        case 0x70: name = " (TCA9548A mux)";          break;
+        case 0x76: name = " (BME280/680/688 0x76)";  break;
+        case 0x77: name = " (BME280/680/688 0x77)";  break;
+      }
+      Serial.printf("           FOUND  0x%02X%s\n", addr, name);
+      found++;
+    } else if (err == 4) {
+      Serial.printf("           ERROR  0x%02X  (check pull-ups)\n", addr);
+    }
+  }
+  Wire.end();
+
+  if (found == 0) Serial.println("           (no devices responded on GPIO16/17)");
+  else            Serial.printf("           --> %d device(s) found\n", found);
+  Serial.println();
+
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%d device(s) found on GPIO16/17", found);
+  pass(buf);
+}
+
+// ════════════════════════════════════════════════════════════
+//  TEST 14 — CAPACITIVE TOUCH PINS
+//  Classic ESP32 touch GPIOs: T0=4, T1=0, T2=2, T3=15,
+//  T4=13, T5=12, T6=14, T7=27, T8=33, T9=32
+//
+//  WROVER conflicts:
+//    T0 = GPIO4  → Camera D0 — SKIPPED
+//    T2 = GPIO2  → SD MISO / LED — reported, still read (SD unmounted)
+//    T7 = GPIO27 → Camera SIOC — SKIPPED
+//  Safe for floating read: T1,T2,T3,T4,T5,T6,T8,T9
+// ════════════════════════════════════════════════════════════
+void testTouchPins() {
+  printHeader("14 . CAPACITIVE TOUCH PINS");
+
+  Serial.println("         ESP32-WROVER classic touch map:");
+  Serial.println("         T0=GPIO4  (SKIP — camera D0)");
+  Serial.println("         T7=GPIO27 (SKIP — camera SIOC)");
+  Serial.println("         T2=GPIO2  (NOTE — SD MISO/LED, SD unmounted)");
+  Serial.println();
+  Serial.printf("         %-5s  %-6s  %-10s  Status\n", "Name", "GPIO", "Raw Count");
+  Serial.println("         -----  ------  ----------  ------");
+
+  struct TouchPin { const char *name; uint8_t gpio; bool skip; const char *note; };
+  const TouchPin pins[] = {
+    {"T0", 4,  true,  "SKIP (camera D0)"},
+    {"T1", 0,  false, ""},
+    {"T2", 2,  false, "NOTE:SD MISO"},
+    {"T3", 15, false, ""},
+    {"T4", 13, false, "NOTE:SD CS"},
+    {"T5", 12, false, ""},
+    {"T6", 14, false, "NOTE:SD SCK"},
+    {"T7", 27, true,  "SKIP (camera SIOC)"},
+    {"T8", 33, false, ""},
+    {"T9", 32, false, ""},
+  };
+
+  int tested = 0, responsive = 0;
+  for (int i = 0; i < 10; i++) {
+    if (pins[i].skip) {
+      Serial.printf("         %-5s  GPIO%-2d  %-10s  %s\n",
+                    pins[i].name, pins[i].gpio, "---", pins[i].note);
+      continue;
+    }
+
+    uint32_t sum = 0;
+    for (int s = 0; s < 4; s++) { sum += touchRead(pins[i].gpio); delay(5); }
+    uint32_t avg = sum / 4;
+
+    uint8_t bars = (uint8_t)min((uint32_t)20, avg / 2000);
+    char bar[22] = {0};
+    for (int b = 0; b < bars; b++) bar[b] = '#';
+
+    Serial.printf("         %-5s  GPIO%-2d  %-10u  |%s  %s\n",
+                  pins[i].name, pins[i].gpio, avg, bar,
+                  strlen(pins[i].note) ? pins[i].note : "");
+
+    tested++;
+    if (avg > 0) responsive++;
+  }
+
+  Serial.println();
+  Serial.println("         Tip: hold a wire to any pin and watch value drop.");
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%d / %d tested touch pins responded", responsive, tested);
+  (responsive == tested) ? pass(buf) : fail(buf);
+}
+
+// ════════════════════════════════════════════════════════════
+//  SUMMARY
+// ════════════════════════════════════════════════════════════
+void printSummary() {
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("  DIAGNOSTIC COMPLETE");
+  Serial.println("  Review any [FAIL] or [WARN] above.");
+  Serial.println("  Heartbeat LED blink = board is alive.");
+  Serial.println("  Reset to run again.");
+  Serial.println("========================================");
+}
+
+// ════════════════════════════════════════════════════════════
+//  SETUP / LOOP
+// ════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("  ESP32 WROVER DIAGNOSTIC SKETCH");
+  Serial.println("  Freenove WROVER  |  Arduino Core v3");
+  Serial.printf ("  SDK:   %s\n", ESP.getSdkVersion());
+  Serial.printf ("  Built: %s  %s\n", __DATE__, __TIME__);
+  Serial.println("========================================");
+
+  testChipInfo();       //  1
+  testMemory();         //  2
+  testPSRAMStress();    //  3  — big PSRAM alloc
+  testTemperature();    //  4
+  testADC();            //  5
+  testGPIO();           //  6  — LED blink BEFORE SD init (GPIO2 shared)
+  testWiFi();           //  7
+  testBluetooth();      //  8
+  testTimer();          //  9
+  testPreferences();    // 10
+  testSD();             // 11  — SD.end() called inside; GPIO2 freed after
+  testCamera();         // 12  — camera deinit called inside
+  testI2C();            // 13  — GPIO16/17 only
+  testTouchPins();      // 14  — skips camera-conflicted pins
+
+  printSummary();
+}
+
+void loop() {
+  // Heartbeat so you know the board is alive after diagnostics
+  digitalWrite(LED_PIN, HIGH); delay(800);
+  digitalWrite(LED_PIN, LOW);  delay(800);
+}
