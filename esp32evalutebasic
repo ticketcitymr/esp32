@@ -1,0 +1,453 @@
+/*
+ * ============================================================
+ *  ESP32 DIAGNOSTIC SKETCH  —  Arduino Core v3.x compatible
+ *  Tests onboard hardware and reports results via Serial
+ * ============================================================
+ *
+ *  WHAT THIS TESTS:
+ *   1.  Chip Info       – model, cores, revision, clock speed
+ *   2.  Flash & PSRAM   – sizes, free heap
+ *   3.  Temperature     – internal temperature sensor
+ *   4.  ADC             – analog read on GPIO34 (input-only pin)
+ *   5.  GPIO / LED      – blink test on GPIO2 (onboard LED)
+ *   6.  WiFi            – capability check + network scan
+ *   7.  Bluetooth       – BT / BLE capability check
+ *   8.  Hardware Timer  – ISR fires at 1 Hz, counted over 2s
+ *   9.  Preferences     – NVS read/write round-trip
+ *  10.  I2C Scanner     – scans both default and alternate bus pins
+ *  11.  Touch Pins      – reads all capacitive touch GPIOs (classic/S2/S3)
+ *
+ *  WIRING (tests 1-9, 11) : None needed — all onboard peripherals.
+ *  WIRING (test 10)       : Connect any I2C devices to SDA/SCL before
+ *                           running; the scan will find them automatically.
+ *                           Default: SDA=GPIO21  SCL=GPIO22
+ *                           Alternate scan: SDA=GPIO16  SCL=GPIO17
+ *  BAUD    : 115200
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Preferences.h>
+#include "esp_chip_info.h"   // v3 requires explicit includes
+#include "esp_mac.h"
+
+// ── Config ───────────────────────────────────────────────────
+#define LED_PIN        2     // Onboard LED (most ESP32 devkits)
+#define ADC_PIN        34    // Input-only pin, safe to float
+#define BLINK_TIMES    6
+#define BLINK_DELAY_MS 250
+
+// I2C scanner — primary and alternate bus pin pairs to try
+#define I2C_SDA_0      21
+#define I2C_SCL_0      22
+#define I2C_SDA_1      16
+#define I2C_SCL_1      17
+#define I2C_FREQ       100000   // 100 kHz for maximum device compatibility
+// ─────────────────────────────────────────────────────────────
+
+Preferences prefs;
+
+// Timer (v3 API)
+volatile uint32_t timerCount = 0;
+hw_timer_t *diagTimer = NULL;
+
+void IRAM_ATTR onTimer() {
+  timerCount++;
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+void printHeader(const char *title) {
+  Serial.println();
+  Serial.println("----------------------------------------");
+  Serial.printf ("  %s\n", title);
+  Serial.println("----------------------------------------");
+}
+void pass(const char *msg) { Serial.printf("  [PASS] %s\n", msg); }
+void fail(const char *msg) { Serial.printf("  [FAIL] %s\n", msg); }
+void info(const char *label, const char *val) {
+  Serial.printf("         %-24s %s\n", label, val);
+}
+void infoU(const char *label, uint32_t val, const char *unit = "") {
+  Serial.printf("         %-24s %u %s\n", label, val, unit);
+}
+
+// ── Test 1 – Chip Info ───────────────────────────────────────
+void testChipInfo() {
+  printHeader("1 . CHIP INFO");
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+
+  const char *model = "Unknown";
+  switch (chip.model) {
+    case CHIP_ESP32:    model = "ESP32";    break;
+    case CHIP_ESP32S2:  model = "ESP32-S2"; break;
+    case CHIP_ESP32S3:  model = "ESP32-S3"; break;
+    case CHIP_ESP32C3:  model = "ESP32-C3"; break;
+    default:            model = "Other";    break;
+  }
+
+  info("Model:",          model);
+  infoU("CPU cores:",     chip.cores);
+  infoU("CPU frequency:", getCpuFrequencyMhz(), "MHz");
+  infoU("Chip revision:", chip.revision);
+  info("SDK version:",    ESP.getSdkVersion());
+
+  char feat[80] = "";
+  if (chip.features & CHIP_FEATURE_WIFI_BGN)  strcat(feat, "WiFi ");
+  if (chip.features & CHIP_FEATURE_BT)        strcat(feat, "BT ");
+  if (chip.features & CHIP_FEATURE_BLE)       strcat(feat, "BLE ");
+  if (chip.features & CHIP_FEATURE_EMB_FLASH) strcat(feat, "EmbFlash ");
+  if (strlen(feat) == 0) strcat(feat, "(none detected)");
+  info("Features:", feat);
+
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char macStr[20];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  info("WiFi MAC:", macStr);
+
+  pass("Chip info OK");
+}
+
+// ── Test 2 – Flash & Memory ──────────────────────────────────
+void testMemory() {
+  printHeader("2 . FLASH & MEMORY");
+
+  infoU("Flash size:",    ESP.getFlashChipSize()   / 1024, "KB");
+  infoU("Flash speed:",   ESP.getFlashChipSpeed()  / 1000000, "MHz");
+  infoU("Sketch size:",   ESP.getSketchSize(),      "bytes");
+  infoU("Free sketch:",   ESP.getFreeSketchSpace(), "bytes");
+  infoU("Free heap:",     ESP.getFreeHeap(),         "bytes");
+  infoU("Min free heap:", ESP.getMinFreeHeap(),      "bytes");
+
+  if (psramFound()) {
+    infoU("PSRAM size:", ESP.getPsramSize() / 1024, "KB");
+    infoU("Free PSRAM:", ESP.getFreePsram(),         "bytes");
+    pass("PSRAM detected");
+  } else {
+    info("PSRAM:", "not present / not found");
+    pass("Memory info OK");
+  }
+}
+
+// ── Test 3 – Internal Temperature ───────────────────────────
+void testTemperature() {
+  printHeader("3 . INTERNAL TEMPERATURE SENSOR");
+
+  float tempC = temperatureRead();
+
+  if (isnan(tempC)) {
+    fail("Temperature sensor returned NaN");
+  } else {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%.1f C  /  %.1f F", tempC, tempC * 9.0f / 5.0f + 32.0f);
+    info("Die temperature:", buf);
+    (tempC > 0 && tempC < 120) ? pass("Temperature plausible") : fail("Value out of expected range");
+  }
+}
+
+// ── Test 4 – ADC ─────────────────────────────────────────────
+void testADC() {
+  printHeader("4 . ADC  (GPIO34 — floating)");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogRead(ADC_PIN); delay(5); }
+  uint32_t avg = sum / 16;
+
+  infoU("GPIO:", ADC_PIN);
+  infoU("12-bit avg:", avg, "(0-4095, float = noise, OK)");
+  infoU("Approx mV:", (avg * 3300UL) / 4095, "mV");
+  pass("ADC read complete");
+}
+
+// ── Test 5 – GPIO / LED Blink ────────────────────────────────
+void testGPIO() {
+  printHeader("5 . GPIO / ONBOARD LED BLINK");
+
+  infoU("LED pin:", LED_PIN);
+  pinMode(LED_PIN, OUTPUT);
+  Serial.printf("         Blinking %d times — watch your board...\n", BLINK_TIMES);
+
+  for (int i = 0; i < BLINK_TIMES; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(BLINK_DELAY_MS);
+    digitalWrite(LED_PIN, LOW);  delay(BLINK_DELAY_MS);
+  }
+  pass("GPIO blink done");
+}
+
+// ── Test 6 – WiFi Scan ───────────────────────────────────────
+void testWiFi() {
+  printHeader("6 . WiFi SCAN");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("         Scanning for networks...");
+  int n = WiFi.scanNetworks();
+  delay(300);
+
+  if (n < 0) { fail("Scan failed"); return; }
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", n);
+  info("Networks found:", buf);
+
+  int show = min(n, 5);
+  for (int i = 0; i < show; i++) {
+    Serial.printf("           [%d] RSSI %-4d  Ch %-2d  %s\n",
+                  i + 1, WiFi.RSSI(i), WiFi.channel(i), WiFi.SSID(i).c_str());
+  }
+  if (n > 5) Serial.printf("           ... and %d more\n", n - 5);
+
+  WiFi.scanDelete();
+  pass("WiFi scan OK");
+}
+
+// ── Test 7 – Bluetooth Capability ───────────────────────────
+void testBluetooth() {
+  printHeader("7 . BLUETOOTH CAPABILITY");
+
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+
+  bool hasBT  = (chip.features & CHIP_FEATURE_BT)  != 0;
+  bool hasBLE = (chip.features & CHIP_FEATURE_BLE) != 0;
+
+  hasBT  ? pass("Classic Bluetooth present") : info("Classic BT:", "not on this variant");
+  hasBLE ? pass("BLE present")               : info("BLE:",        "not on this variant");
+}
+
+// ── Test 8 – Hardware Timer (v3 API) ─────────────────────────
+void testTimer() {
+  printHeader("8 . HARDWARE TIMER  (v3 API)");
+
+  timerCount = 0;
+
+  // v3 API: timerBegin(freq_hz), timerAttachInterrupt(t, fn),
+  //         timerAlarm(t, alarm_val, autoreload, reload_count)
+  diagTimer = timerBegin(1000000);            // 1 MHz tick rate
+  timerAttachInterrupt(diagTimer, &onTimer);  // no 3rd bool arg in v3
+  timerAlarm(diagTimer, 1000000, true, 0);    // fire every 1 s, repeat forever
+
+  Serial.println("         Waiting ~2.1 s for timer ISR...");
+  delay(2100);
+
+  timerEnd(diagTimer);  // stops and frees the timer
+
+  infoU("ISR fires in 2.1 s:", timerCount, "(expect 2)");
+  (timerCount >= 2) ? pass("Hardware timer working") : fail("Timer ISR did not fire correctly");
+}
+
+// ── Test 9 – NVS Preferences ─────────────────────────────────
+void testPreferences() {
+  printHeader("9 . NVS PREFERENCES  (non-volatile storage)");
+
+  const uint32_t MAGIC = 0xDEADBEEF;
+
+  prefs.begin("diag", false);
+  prefs.putUInt("magic", MAGIC);
+  uint32_t rb = prefs.getUInt("magic", 0);
+  prefs.remove("magic");
+  prefs.end();
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "0x%08X", rb);
+  info("Read back:", buf);
+
+  (rb == MAGIC) ? pass("NVS round-trip OK") : fail("NVS mismatch — flash issue?");
+}
+
+// ── Test 10 – I2C Scanner ────────────────────────────────────
+// Scans a given bus and prints every device that ACKs.
+// Returns the number of devices found.
+int scanI2CBus(TwoWire &bus, int sda, int scl, const char *busName) {
+  Serial.printf("         Bus %-10s SDA=GPIO%-2d  SCL=GPIO%-2d\n", busName, sda, scl);
+
+  bus.begin(sda, scl, I2C_FREQ);
+  delay(50);
+
+  int found = 0;
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+    bus.beginTransmission(addr);
+    uint8_t err = bus.endTransmission();
+
+    if (err == 0) {
+      // Look up common device names
+      const char *name = "";
+      switch (addr) {
+        case 0x20: name = " (PCF8574 / MCP23017)";   break;
+        case 0x27: name = " (PCF8574 LCD backpack)";  break;
+        case 0x29: name = " (VL53L0X / TCS34725)";   break;
+        case 0x3C: name = " (SSD1306 OLED 0x3C)";    break;
+        case 0x3D: name = " (SSD1306 OLED 0x3D)";    break;
+        case 0x40: name = " (INA219 / PCA9685)";      break;
+        case 0x48: name = " (ADS1115 / TMP102)";      break;
+        case 0x49: name = " (ADS1115 addr1)";         break;
+        case 0x4A: name = " (ADS1115 addr2)";         break;
+        case 0x4B: name = " (ADS1115 addr3)";         break;
+        case 0x57: name = " (ATSHA204A)";             break;
+        case 0x60: name = " (MPU6050 alt / SI1145)";  break;
+        case 0x68: name = " (MPU6050 / DS3231 RTC)";  break;
+        case 0x69: name = " (MPU6050 AD0=1)";         break;
+        case 0x70: name = " (TCA9548A mux)";          break;
+        case 0x76: name = " (BME280/680/688 0x76)";   break;
+        case 0x77: name = " (BME280/680/688 0x77)";   break;
+      }
+      Serial.printf("           FOUND  0x%02X%s\n", addr, name);
+      found++;
+    } else if (err == 4) {
+      Serial.printf("           ERROR  0x%02X  (bus error — check pull-ups)\n", addr);
+    }
+  }
+
+  bus.end();
+
+  if (found == 0) {
+    Serial.println("           (no devices responded)");
+  } else {
+    Serial.printf("           --> %d device(s) found\n", found);
+  }
+  return found;
+}
+
+void testI2C() {
+  printHeader("10 . I2C SCANNER");
+  Serial.println("         Scanning 0x08–0x77 on two pin pairs...");
+  Serial.println();
+
+  int total = 0;
+  total += scanI2CBus(Wire,  I2C_SDA_0, I2C_SCL_0, "Wire (primary)");
+  Serial.println();
+  total += scanI2CBus(Wire1, I2C_SDA_1, I2C_SCL_1, "Wire1 (alt)");
+
+  Serial.println();
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d device(s) found across both buses", total);
+  (total > 0) ? pass(buf) : pass("Scan complete — no devices wired up (OK)");
+}
+
+// ── Test 11 – Capacitive Touch Pin Mapper ────────────────────
+// Reads all touch-capable GPIOs and prints raw capacitance counts.
+// Hover/touch a wire on a pin and watch the value drop.
+//
+// Touch threshold: values BELOW ~35000 (v3 uses higher counts
+// vs older core) when touched. Baseline floats ~40000–80000.
+//
+// Chip support:
+//   ESP32 classic  – T0-T9 (GPIO 4,0,2,15,13,12,14,27,33,32)
+//   ESP32-S2/S3    – T1-T14 (GPIO 1–14)
+//   ESP32-C3       – NO touch controller
+
+void testTouchPins() {
+  printHeader("11 . CAPACITIVE TOUCH PIN MAPPER");
+
+#if CONFIG_IDF_TARGET_ESP32
+  // Classic ESP32 touch pins
+  const uint8_t touchGPIO[] = { 4, 0, 2, 15, 13, 12, 14, 27, 33, 32 };
+  const char   *touchName[] = {"T0","T1","T2","T3","T4","T5","T6","T7","T8","T9"};
+  const int     touchCount  = 10;
+  Serial.println("         Chip: ESP32 classic  (T0-T9, 10 pins)");
+
+#elif CONFIG_IDF_TARGET_ESP32S2
+  const uint8_t touchGPIO[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14 };
+  const char   *touchName[] = {"T1","T2","T3","T4","T5","T6","T7",
+                                "T8","T9","T10","T11","T12","T13","T14"};
+  const int     touchCount  = 14;
+  Serial.println("         Chip: ESP32-S2  (T1-T14, 14 pins)");
+
+#elif CONFIG_IDF_TARGET_ESP32S3
+  const uint8_t touchGPIO[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14 };
+  const char   *touchName[] = {"T1","T2","T3","T4","T5","T6","T7",
+                                "T8","T9","T10","T11","T12","T13","T14"};
+  const int     touchCount  = 14;
+  Serial.println("         Chip: ESP32-S3  (T1-T14, 14 pins)");
+
+#else
+  Serial.println("         Touch controller NOT available on this chip variant (C3 etc.)");
+  info("Touch test:", "skipped");
+  return;
+#endif
+
+  Serial.println("         High value = untouched  |  Low value = finger/wire present");
+  Serial.println("         (Run in loop mode below to watch values live)");
+  Serial.println();
+  Serial.printf("         %-6s  %-6s  %s\n", "Name", "GPIO", "Raw Count");
+  Serial.println("         ------  ------  ----------");
+
+  int responsive = 0;
+  for (int i = 0; i < touchCount; i++) {
+    // Take 4 samples and average to reduce noise
+    uint32_t sum = 0;
+    for (int s = 0; s < 4; s++) {
+      sum += touchRead(touchGPIO[i]);
+      delay(5);
+    }
+    uint32_t avg = sum / 4;
+
+    // Bar graph — each block = ~2000 counts, max 20 blocks
+    uint8_t bars = (uint8_t)min((uint32_t)20, avg / 2000);
+    char bar[22]; memset(bar, 0, sizeof(bar));
+    for (int b = 0; b < bars; b++) bar[b] = '#';
+
+    Serial.printf("         %-6s  GPIO%-2d  %-10u  |%s\n",
+                  touchName[i], touchGPIO[i], avg, bar);
+
+    if (avg > 0) responsive++;
+  }
+
+  Serial.println();
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%d / %d touch pins responded", responsive, touchCount);
+  (responsive == touchCount) ? pass(buf) : fail(buf);
+}
+
+// ── Summary ──────────────────────────────────────────────────
+void printSummary() {
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("  DIAGNOSTIC COMPLETE");
+  Serial.println("  Check any [FAIL] lines above.");
+  Serial.println("  Board will slow-blink to show alive.");
+  Serial.println("  Reset to run again.");
+  Serial.println("========================================");
+}
+
+// ── Entry Points ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(600);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("  ESP32 DIAGNOSTIC SKETCH  (core v3)");
+  Serial.printf ("  SDK:   %s\n", ESP.getSdkVersion());
+  Serial.printf ("  Built: %s  %s\n", __DATE__, __TIME__);
+  Serial.println("========================================");
+
+  testChipInfo();
+  testMemory();
+  testTemperature();
+  testADC();
+  testGPIO();
+  testWiFi();
+  testBluetooth();
+  testTimer();
+  testPreferences();
+  testI2C();
+  testTouchPins();
+
+  printSummary();
+}
+
+void loop() {
+  digitalWrite(LED_PIN, HIGH); delay(1000);
+  digitalWrite(LED_PIN, LOW);  delay(1000);
+}
